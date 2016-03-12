@@ -1,0 +1,332 @@
+#! /bin/sh
+
+INITLOG=/sbin/initlog
+SENDMAIL=/usr/sbin/sendmail
+
+EMAIL=user@localhost
+ROOTHISTDIR=/var/lib/fhist
+WATCHTIME=10
+STOPTIME=1
+
+PROG="$0"
+PROGNAME="`basename $PROG`"
+PROGARGS="$@"
+
+INITLOGARGS=""
+SENDMAILARGS="-i -f -t $EMAIL"
+
+LOGNAME="$PROGNAME[$$]"
+INFILE="$1"
+shift
+
+PID=$$
+WATCHDOGPID=""
+WORKPID=""
+KILLPID=""
+TMPDIR=""
+
+sendemail()
+{
+	# $1 -- msg
+
+	$SENDMAIL $SENDMAILARGS <<-EOF
+	Subject: [ERR] $LOGNAME
+
+	$1
+	EOF
+}
+
+log()
+{
+	# $1 -- priority
+	# $2 -- msg
+	# $3 -- event
+
+	$INITLOG $INITLOGARGS -n "$LOGNAME" -p $1 ${3:+-e $3} ${2:+-s "$2"}
+}
+
+errlog()
+{
+	# $1 -- msg
+
+	log err "$1"
+	sendemail "$1"
+	echo "ERR: $LOGNAME: $1" >&2
+	log err "" 2
+
+}
+
+cleanup_handler()
+{
+	trap - EXIT
+	[ -z "$TMPDIR" ] || rm -rf "$TMPDIR"
+	[ -z "$WATCHDOGPID" ] || \
+		kill -s TERM $WATCHDOGPID &>/dev/null
+	exit "$@"
+}
+
+exit_handler()
+{
+	cleanup_handler $?
+}
+
+signal_handler()
+{
+	cleanup_handler 1
+}
+
+workkill_action()
+{
+	[ -z "$WORKPID" ] || [ -z "$KILLPID" ] || \
+		kill -s RTMIN $WORKPID &>/dev/null || \
+		kill -s TERM $KILLPID &>/dev/null
+
+}
+
+trap_reset()
+{
+	trap - RTMIN RTMIN+1 EXIT HUP PIPE INT QUIT TERM
+}
+
+workstop_action()
+{
+	trap_reset
+	if [ -n "$WORKPID" ]; then
+		{
+			sleep $STOPTIME
+			errlog "Completion time work > $STOPTIME seconds! Use kill -9 $WORKPID"
+			kill -s KILL $WORKPID &>/dev/null
+		} &
+		KILLPID=$!
+		trap workkill_action CHLD
+		kill -s TERM $WORKPID &>/dev/null || workkill_action
+		wait $KILLPID &>/dev/null
+		trap - CHLD
+		KILLPID=""
+	fi
+
+	signal_handler
+}
+
+watchdog_action()
+{
+	errlog "Operating time > $WATCHTIME seconds!"
+	workstop_action
+}
+
+kill_action()
+{
+	MSG="Operation aborted externally!"
+	log warning "$MSG"
+	echo "WARN: $LOGNAME: $MSG" >&2
+	workstop_action
+}
+
+err()
+{
+	# $1 -- msg
+
+	errlog "$1"
+	workstop_action
+
+}
+
+workerr()
+{
+	# $1 -- msg
+
+	errlog "$1"
+	kill -s RTMIN+1 $PID &>/dev/null &
+	exit 1
+}
+
+workwarn()
+{
+	# $1 -- msg
+
+	log warning "$1"
+	echo "WARN: $LOGNAME: $1" >&2
+	kill -s RTMIN+1 $PID &>/dev/null &
+	exit 0
+}
+
+trap_init()
+{
+	trap kill_action HUP PIPE INT QUIT TERM
+	trap workstop_action RTMIN+1
+	trap watchdog_action RTMIN
+}
+
+waitwork()
+{
+	WORKPID=$!
+	trap_init
+	wait $WORKPID &>/dev/null || signal_handler $?
+	usleep 10
+	WORKPID=""
+	trap_init
+}
+
+gethistoryfiles()
+{
+	find "$HISTDIR" -maxdepth 1 -mindepth 1 -regextype sed -regex '.*/\+[1-9][0-9]*\.[[:xdigit:]]\{40\}' -printf '%f\n' | sort -t. -k1nr,2
+}
+
+workrmfile()
+{
+	# $1 -- file
+
+	RMFILE="$1"
+	rm -f "$RMFILE" || workerr "Failed to delete the file $RMFILE!"
+	log debug "Remove file $RMFILE:" 1
+}
+
+# start watchdog
+{
+	sleep $WATCHTIME
+	kill -s RTMIN $PID &>/dev/null
+} &
+WATCHDOGPID=$!
+trap_init
+
+# set history dir
+HISTDIR="$ROOTHISTDIR/`echo "$INFILE" | sha1sum - | sed -n 's/[[:space:]].*$//p'`"
+log debug "Directory for history: $HISTDIR"
+
+# set start time stamp
+STARTTIMESTAMP=`date '+%s'`
+log debug "Start timestamp: $STARTTIMESTAMP"
+
+# create tmpdir
+NEWTMPDIR="$HISTDIR/.$STARTTIMESTAMP"
+PIDFILE="$NEWTMPDIR/pid"
+{
+	trap_reset
+
+	[ ! -e "$NEWTMPDIR" ] || workerr "Directory $NEWTMPDIR already exists!"
+
+	MSG="Create a temporary directory $NEWTMPDIR"
+	if mkdir -p "$NEWTMPDIR"; then
+		log debug "$MSG" 1
+	else
+		workerr "$MSG: failed"
+	fi
+
+	usleep $RANDOM
+	[ ! -e "$PIDFILE" ] || workerr "Pid file $PIDFILE already exists!"
+	echo $PID > "$PIDFILE"
+} &
+waitwork
+
+# check saved pid
+{
+	trap_reset
+
+	usleep $RANDOM
+	read SAVEDPID <"$PIDFILE" 2>/dev/null || workerr "Error reading file $PIDFILE!"
+	[ "$SAVEDPID" -eq $PID ] || workerr "$PROGNAME[$SAVEDPID] already up and running!"
+} &
+waitwork
+
+# set tmpdir
+TMPDIR="$NEWTMPDIR"
+trap_init
+log debug "Use temporary directory: $NEWTMPDIR"
+
+# check time stamp and file save
+{
+	trap_reset
+	export LC_ALL=C
+
+	OLDFILE=`gethistoryfiles | head -n 1` || \
+		workerr "Error reading the file list!"
+
+	OLDTIMESTAMP=`echo "$OLDFILE" | \
+		sed -rn '1s/^([1-9][0-9]*)\.[[:xdigit:]]{40}$/\1/p'`
+	if [ -n "$OLDTIMESTAMP" ]; then
+		[ "$STARTTIMESTAMP" -gt "$OLDTIMESTAMP" ] || \
+			workwarn "Already saved a new version of the file."
+	else
+		OLDTIMESTAMP=0
+	fi
+
+	# copy INFILE
+	[ -f "$INFILE" ] || workwarn "File $INFILE does not exist or is not a regular file."
+	cp -Lp --sparse=always "$INFILE" "$TMPDIR/file" || workerr "File $INFILE copy error!"
+
+	SHA1=`sha1sum "$TMPDIR/file" | sed -rn '1s/(^[[:xdigit:]]{40})[[:space:]].*$/\1/p'` || \
+		workerr "Error computing the hash sum!"
+
+	[ -n "$SHA1" ] || workerr "Hash sum to be determined!"
+
+	OLDSHA1=`echo "$OLDFILE" | \
+		sed -rn '1s/^[1-9][0-9]*\.([[:xdigit:]]{40})$/\1/p'`
+
+	let "DELTAT = STARTTIMESTAMP - OLDTIMESTAMP"
+
+	if [ "$SHA1" != "$OLDSHA1" ] || [ $DELTAT -ge 3600 ]; then
+		mv -n "$TMPDIR/file" "$HISTDIR/$STARTTIMESTAMP.$SHA1" || \
+			workerr "Error creating file $HISTDIR/$STARTTIMESTAMP.$SHA1"
+	else
+		workwarn "The file $INFILE is copied less than an hour ago."
+	fi
+
+	rm -rf "$TMPDIR" || workerr "Failed to delete the temporary directory $TMPDIR!"
+	log debug "Remove temporary directory $TMPDIR:" 1
+} &
+waitwork
+TMPDIR=""
+trap_init
+
+# clean
+{
+	trap_reset
+	export LC_ALL=C
+
+	TIMESTAMP1=""
+	TIMESTAMP2=""
+	HASH1=""
+	HASH2=""
+	N=0
+
+	gethistoryfiles | \
+		while IFS=. read TIMESTAMP HASH
+		do
+			case $N in
+				0)
+					if [ "$TIMESTAMP" -eq "$STARTTIMESTAMP" ]; then
+						TIMESTAMP1="$TIMESTAMP"
+						HASH1="$HASH"
+						N=1
+					else
+						workwarn "Now the timestamp $TIMESTAMP of the other processed."
+					fi
+					;;
+				1)
+					TIMESTAMP2="$TIMESTAMP"
+					HASH2="$HASH"
+					N=2
+					;;
+				24)
+					# remove old files
+					workrmfile "$HISTDIR/$TIMESTAMP.$HASH"
+					;;
+				*)
+					let "DELTAT = TIMESTAMP1 - TIMESTAMP"
+					if [ $DELTAT -lt 60 ] || \
+							[ "$HASH" = "$HASH1" -a "$HASH" = "$HASH2" -a $DELTAT -gt 3600 ]; then
+						workrmfile "$HISTDIR/$TIMESTAMP2.$HASH2"
+					else
+						TIMESTAMP1="$TIMESTAMP2"
+						HASH1="$HASH2"
+						let "N = N + 1"
+					fi
+					TIMESTAMP2="$TIMESTAMP"
+					HASH2="$HASH"
+					;;
+			esac
+		done
+} &
+waitwork
+
+exit 0
